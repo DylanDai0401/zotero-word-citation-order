@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Word 引文顺序",
+  "version": "1.4.0",
+  "description": "在 Zotero 条目列表中显示 Word 稿件的首次引用顺序。",
+  "applications": {
+    "zotero": {
+      "id": "word-citation-tags@research-tools.local",
+      "update_url": "https://zotero-word-citation-tags.invalid/updates.json",
+      "strict_min_version": "10.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}
