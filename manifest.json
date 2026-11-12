@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Word 引文顺序",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "在 Zotero 条目列表中显示 Word 稿件的首次引用顺序。",
   "applications": {
     "zotero": {

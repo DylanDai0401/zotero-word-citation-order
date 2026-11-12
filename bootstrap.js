@@ -14,12 +14,16 @@ let childProcess;
 let pendingSnapshot;
 let snapshotScriptURL;
 const linkedWordCommands = new Map();
+const wordPaths = new WeakMap();
+const documents = new Map();
+const latestByCollection = new Map();
+let latestDocument;
+let originalGetApplication;
+let linkedGetApplication;
 let readVersion = 0;
 let manualInProgress = false;
 let stopped = false;
 let lastAutomaticSignature;
-let savedPath = "";
-let ranks = new Map();
 
 function startup({ id, rootURI }) {
     snapshotScriptURL = rootURI + "word-snapshot.ps1";
@@ -35,7 +39,7 @@ function startup({ id, rootURI }) {
         width: "90",
         dataProvider: item => {
             if (item.libraryID !== Zotero.Libraries.userLibraryID) return "";
-            const rank = ranks.get(item.key);
+            const rank = displayedDocument(Zotero.getActiveZoteroPane())?.ranks.get(item.key);
             return rank === undefined ? "" : String(rank).padStart(10, "0");
         },
         renderCell(_index, data, column, _isFirstColumn, document) {
@@ -49,14 +53,26 @@ function startup({ id, rootURI }) {
         menuID: "word-citation-tags",
         pluginID: id,
         target: "main/menubar/tools",
-        menus: [{
-            menuType: "menuitem",
-            l10nID: "word-citation-tags-open",
-            onCommand: event => readAndSave(event.target.ownerGlobal),
-        }],
+        menus: [
+            {
+                menuType: "menuitem",
+                l10nID: "word-citation-tags-open",
+                onCommand: event => readAndSave(event.target.ownerGlobal),
+            },
+            {
+                menuType: "menuitem",
+                l10nID: "word-citation-tags-switch",
+                onCommand: event => switchDocument(event.target.ownerGlobal)
+                    .catch(error => Zotero.logError(error)),
+            },
+        ],
     });
     linkWordCommands();
-    if (Zotero.isWin) Zotero.uiReadyPromise.then(() => scheduleWordRead(0));
+    Zotero.uiReadyPromise.then(async () => {
+        if (stopped) return;
+        await associateLegacyOrder();
+        if (Zotero.isWin) scheduleWordRead(0);
+    }).catch(error => Zotero.logError(error));
 }
 
 function onMainWindowLoad({ window }) {
@@ -71,6 +87,9 @@ function shutdown() {
     stopped = true;
     pollTimer?.cancel();
     childProcess?.kill().catch(error => Zotero.logError(error));
+    if (Zotero.Integration.getApplication === linkedGetApplication) {
+        Zotero.Integration.getApplication = originalGetApplication;
+    }
     const integration = Zotero.Integration.Interface.prototype;
     for (const [name, { original, wrapper }] of linkedWordCommands) {
         if (integration[name] === wrapper) integration[name] = original;
@@ -84,9 +103,17 @@ function shutdown() {
 }
 
 function linkWordCommands() {
-    const integration = Zotero.Integration.Interface.prototype;
+    const integration = Zotero.Integration;
+    originalGetApplication = integration.getApplication;
+    linkedGetApplication = function (agent, command, path) {
+        const app = originalGetApplication.apply(this, arguments);
+        if (agent === "WinWord" && path) wordPaths.set(app, path);
+        return app;
+    };
+    integration.getApplication = linkedGetApplication;
+    const methods = integration.Interface.prototype;
     for (const name of ["addEditCitation", "addCitation", "refresh"]) {
-        const original = integration[name];
+        const original = methods[name];
         const wrapper = async function (...args) {
             const result = await original.apply(this, args);
             if (!stopped && this._app.processorName === "Word") {
@@ -99,12 +126,15 @@ function linkWordCommands() {
             }
             return result;
         };
-        integration[name] = wrapper;
+        methods[name] = wrapper;
         linkedWordCommands.set(name, { original, wrapper });
     }
 }
 
 async function queueConfirmedOrder(command, name) {
+    const path = wordPaths.get(command._app);
+    if (!path) return;
+    const collection = selectedCollection(Zotero.getActiveZoteroPane());
     const version = ++readVersion;
     const finished = Zotero.Integration.currentCommandPromise;
     const fromSession = name === "refresh" || !command._session.data.prefs.delayCitationUpdates;
@@ -131,7 +161,7 @@ async function queueConfirmedOrder(command, name) {
         const ordered = await resolveCitations(citations, fromSession);
         if (stopped || version !== readVersion) return;
         lastAutomaticSignature = undefined;
-        await saveOrder("", ordered);
+        await saveOrder(path, ordered, collection);
     }).catch(error => Zotero.logError(error));
 }
 
@@ -140,12 +170,98 @@ function restoreOrder() {
         const value = Zotero.Prefs.get(SNAPSHOT_PREF, true);
         if (!value) return;
         const saved = JSON.parse(value);
-        ranks = new Map(saved.ranks);
-        savedPath = saved.path;
+        if (Array.isArray(saved.documents)) {
+            for (const [key, document] of saved.documents) {
+                documents.set(key, { ...document, ranks: new Map(document.ranks) });
+            }
+        }
+        else if (Array.isArray(saved.ranks) && saved.ranks.length) {
+            documents.set(documentKey(saved.path) || "legacy", {
+                path: saved.path || "",
+                collectionKey: null,
+                ranks: new Map(saved.ranks),
+                legacy: true,
+            });
+        }
+        indexCollections();
     }
     catch (error) {
         Zotero.logError(error);
     }
+}
+
+function documentKey(path) {
+    if (!path) return "";
+    if (!Zotero.isWin) return path;
+    if (/^https?:\/\//i.test(path)) return path.replaceAll("\\", "/");
+    return path.replaceAll("/", "\\").toLowerCase();
+}
+
+function selectedCollection(pane) {
+    const collections = pane?.getSelectedCollections?.() ?? [];
+    return collections.length === 1 ? collections[0] : null;
+}
+
+function displayedDocument(pane) {
+    const collections = pane?.getSelectedCollections?.() ?? [];
+    if (collections.length > 1) return undefined;
+    if (collections.length === 1) {
+        return collections[0].libraryID === Zotero.Libraries.userLibraryID
+            ? latestByCollection.get(collections[0].key)
+            : undefined;
+    }
+    return latestDocument;
+}
+
+function indexCollections() {
+    latestByCollection.clear();
+    latestDocument = undefined;
+    for (const document of documents.values()) {
+        if (document.collectionKey) latestByCollection.set(document.collectionKey, document);
+        latestDocument = document;
+    }
+}
+
+function inferCollection(items, preferred) {
+    const candidates = new Map();
+    for (const item of items) {
+        const memberships = new Set();
+        for (const id of item.getCollections()) {
+            let collection = Zotero.Collections.get(id);
+            while (collection && !memberships.has(collection.id)) {
+                memberships.add(collection.id);
+                collection = collection.parentID ? Zotero.Collections.get(collection.parentID) : null;
+            }
+        }
+        for (const id of memberships) candidates.set(id, (candidates.get(id) ?? 0) + 1);
+    }
+    if (!candidates.size) return null;
+    const maximum = Math.max(...candidates.values());
+    const best = [...candidates.keys()].filter(id => candidates.get(id) === maximum);
+    // Prefer the specific project when a parent and its subfolder contain the same citations.
+    const ancestors = new Set();
+    for (const id of best) {
+        let parent = Zotero.Collections.get(id)?.parentID;
+        while (parent) {
+            ancestors.add(parent);
+            parent = Zotero.Collections.get(parent)?.parentID;
+        }
+    }
+    const projects = best.filter(id => !ancestors.has(id));
+    if (projects.length === 1) return Zotero.Collections.get(projects[0])?.key ?? null;
+    return preferred && projects.includes(preferred.id) ? preferred.key : null;
+}
+
+async function associateLegacyOrder() {
+    const legacy = [...documents.values()].find(document => document.legacy);
+    if (!legacy) return;
+    const items = await Promise.all([...legacy.ranks.keys()].map(key =>
+        Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, key)));
+    if (stopped || !legacy.legacy) return;
+    legacy.collectionKey = inferCollection(items.filter(item => item && !item.deleted),
+        selectedCollection(Zotero.getActiveZoteroPane()));
+    delete legacy.legacy;
+    await persistOrders();
 }
 
 async function chooseDocument(window) {
@@ -193,8 +309,11 @@ async function readActiveWord() {
     }
     const document = readSnapshotDocument(window, snapshot);
     if (!document) return;
+    const previous = documents.get(documentKey(document.path));
+    const collection = selectedCollection(window.ZoteroPane);
     const signature = JSON.stringify([
         document.path,
+        previous?.collectionKey ?? collection?.key,
         document.citations.map(({ id, uris, uri }) => [id, uris, uri]),
     ]);
     if (signature === lastAutomaticSignature) return;
@@ -202,8 +321,8 @@ async function readActiveWord() {
     const ordered = await resolveCitations(document.citations);
     if (stopped || manualInProgress || Zotero.Integration.currentDoc || version !== readVersion) return;
     if (ordered.length && !ordered.some(entry => entry.item)) return;
-    if (ordered.length || document.path === savedPath) {
-        await saveOrder(document.path, ordered);
+    if (ordered.length || previous) {
+        await saveOrder(document.path, ordered, collection);
     }
     lastAutomaticSignature = signature;
 }
@@ -212,6 +331,7 @@ async function readAndSave(window) {
     if (manualInProgress || stopped) return;
     manualInProgress = true;
     try {
+        const collection = selectedCollection(window.ZoteroPane);
         const document = await chooseDocument(window);
         if (!document || stopped) return;
         const version = ++readVersion;
@@ -222,7 +342,9 @@ async function readAndSave(window) {
         if (ordered.length && !matched) {
             throw new Error("这份稿件的引文未匹配到「我的文库」中的条目。上次的引文顺序仍可查看。");
         }
-        await saveOrder(document.path, ordered);
+        if (ordered.length || documents.has(documentKey(document.path))) {
+            await saveOrder(document.path, ordered, collection);
+        }
 
         const unmatched = ordered.filter(entry => !entry.item);
         const details = unmatched.slice(0, 8).map(entry => entry.number + " " + entry.title);
@@ -282,17 +404,54 @@ async function queryWord(window) {
     }
 }
 
-async function saveOrder(path, ordered) {
-    const nextRanks = new Map(ordered.filter(entry => entry.item)
-        .map(entry => [entry.item.key, entry.number]));
-    const changed = ranks.size !== nextRanks.size
-        || [...nextRanks].some(([key, rank]) => ranks.get(key) !== rank);
-    if (!changed && path === savedPath) return;
-    Zotero.Prefs.set(SNAPSHOT_PREF, JSON.stringify({ path, ranks: [...nextRanks] }), true);
-    ranks = nextRanks;
-    savedPath = path;
-    if (!changed) return;
+async function saveOrder(path, ordered, preferredCollection) {
+    const key = documentKey(path);
+    if (!key) return;
+    const previous = documents.get(key);
+    const matched = ordered.filter(entry => entry.item);
+    if (ordered.length && !matched.length) return;
+    const ranks = new Map(matched.map(entry => [entry.item.key, entry.number]));
+    const collectionKey = previous?.collectionKey
+        ?? inferCollection(matched.map(entry => entry.item), preferredCollection);
+    if (previous && previous === latestDocument && previous.collectionKey === collectionKey
+        && previous.ranks.size === ranks.size
+        && [...ranks].every(([itemKey, rank]) => previous.ranks.get(itemKey) === rank)) return;
 
+    // Reinsert to remember the most recently read manuscript in each collection.
+    documents.delete(key);
+    documents.set(key, { path, collectionKey, ranks });
+    await persistOrders();
+}
+
+async function switchDocument(window) {
+    const collection = selectedCollection(window.ZoteroPane);
+    const entries = [...documents].reverse().filter(([, document]) =>
+        !collection || !document.collectionKey || document.collectionKey === collection.key);
+    if (!entries.length) {
+        Services.prompt.alert(window, PLUGIN_NAME, "当前分类还没有稿件的引文顺序。");
+        return;
+    }
+    const names = entries.map(([, document]) => document.path.split(/[\\/]/).at(-1) || "上次读取的稿件");
+    const labels = names.map((name, index) => names.indexOf(name) === names.lastIndexOf(name)
+        ? name : entries[index][1].path);
+    const selection = { value: 0 };
+    const message = collection ? "选择要在此分类显示的稿件" : "选择要显示的稿件";
+    if (!Services.prompt.select(window, PLUGIN_NAME, message, labels, selection)) return;
+    const [key, document] = entries[selection.value];
+    if (!document.collectionKey && collection?.libraryID === Zotero.Libraries.userLibraryID) {
+        document.collectionKey = collection.key;
+    }
+    documents.delete(key);
+    documents.set(key, document);
+    await persistOrders();
+}
+
+async function persistOrders() {
+    indexCollections();
+    const saved = [...documents].map(([key, document]) => [
+        key, { ...document, ranks: [...document.ranks] },
+    ]);
+    Zotero.Prefs.set(SNAPSHOT_PREF, JSON.stringify({ documents: saved }), true);
     for (const window of Zotero.getMainWindows()) {
         const view = window.ZoteroPane?.itemsView;
         if (!view?.tree) continue;
